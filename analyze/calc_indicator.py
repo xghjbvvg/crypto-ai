@@ -1,19 +1,9 @@
+# -*- coding: utf-8 -*-
 """
-Enhanced Multi-Timeframe Strategy (TDengine + TA-Lib + matplotlib)
-- Loads OHLCV from TDengine via query_df_from_tdengine(table, timeframe, end_time)
-- Computes indicators per timeframe (no forced reindex/resample across TFs)
-- Generates per-TF signals and aggregates into multi-timeframe consensus
-- Calculates stops/targets and plots a three-panel chart
-
-Requirements:
-  pip install pandas numpy TA-Lib ccxt matplotlib mplfinance
-
-Notes:
-- Binance K-line boundaries are aligned to UTC. This script schedules next run
-  against UTC timeframe boundaries.
-- Ensure data.td_dao.query_df_from_tdengine(table, tf, end_time) returns a DataFrame
-  with columns: ['timestamp','open','high','low','close','volume'] or an index
-  already set to a datetime index. Volume must be numeric.
+Enhanced Multi-Timeframe Strategy with Unified Global Lock
+- TDengine + TA-Lib + matplotlib
+- Multi-timeframe signals + BEST ENTRY (Setup vs Trigger) with anti-churn
+- Unified GLOBAL LOCK across all signal types (resonance/singleTF/best) to avoid consecutive signals
 """
 
 import os
@@ -28,14 +18,14 @@ import numpy as np
 import talib
 import ccxt
 
-# Use a headless backend for servers/containers
+# Headless backend for server
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from mplfinance.original_flavor import candlestick_ohlc
 import matplotlib.dates as mdates
 
-# Make local imports work when run as a script
+# Local imports
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from data.td_dao import query_df_from_tdengine
 
@@ -43,10 +33,7 @@ from data.td_dao import query_df_from_tdengine
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('trading_strategy.log'),
-        logging.StreamHandler()
-    ]
+    handlers=[logging.FileHandler('trading_strategy.log'), logging.StreamHandler()]
 )
 
 
@@ -57,25 +44,25 @@ class EnhancedMultiTimeframeStrategy:
         primary_tf: str = '1h',
         secondary_tf: str = '4h',
         tertiary_tf: str = '1d',
-        end_time = datetime.now(),
+        end_time = datetime.utcnow(),
         *,
         table_with_tf: bool = True,
-        confirmation_required: int = 1,  # relaxed: allow immediate trigger in tests
-        rr_tp_index: int = 1,            # index 0/1/2 used to compute displayed RR
-    ):
-        """Initialize enhanced multi-timeframe strategy.
+        confirmation_required: int = 1,
+        rr_tp_index: int = 1,
 
-        Args:
-            symbol: Trading symbol (e.g., 'BTC/USDT').
-            primary_tf: Signal-generation timeframe.
-            secondary_tf: Trend-confirmation timeframe.
-            tertiary_tf: Macro trend timeframe.
-            table_with_tf: If True, expect TDengine table name to include timeframe
-                           as f"{symbol}_{tf}_kline"; otherwise use f"{symbol}_kline".
-            confirmation_required: Number of consecutive scans with the same side
-                           required before confirming combined signal.
-            rr_tp_index: Which TP (0,1,2) to use when reporting RR.
-        """
+        # ====== De-churn & Quality knobs ======
+        require_two_tf: bool = False,             # 至少两TF共振才触发（禁用单TF兜底）
+        min_rr: float = 2.5,                      # 最低RR门槛
+        cooldown_bars: int = 16,                  # 同侧冷却条数（主TF）
+        lock_after_trade_bars: int = 24,          # 【全局锁定】条数（主TF）
+        breakout_buffer_atr: float = 0.30,        # 突破需超过摆动位 ±0.30*ATR
+        min_distance_from_prev_entry_atr: float = 0.60,  # 新入场需与上次价相距 ≥0.6*ATR
+        max_candle_atr: float = 1.2,              # 大实体K过滤
+        session_filter: bool = True,              # 低流动时段过滤
+        reentry_min_bars: int = 8,                # 再入最少间隔条数
+        reentry_reset_k: float = 0.25,            # 需回撤至中轨/EMA50 ±k*ATR 才允许再入
+        require_new_pivot: bool = True,           # 再入需出现新摆动点
+    ):
         self.symbol = symbol
         self.primary_tf = primary_tf
         self.secondary_tf = secondary_tf
@@ -84,69 +71,138 @@ class EnhancedMultiTimeframeStrategy:
         self.confirmation_required = max(0, int(confirmation_required))
         self.rr_tp_index = max(0, min(2, int(rr_tp_index)))
 
+        # 去噪参数
+        self.require_two_tf = bool(require_two_tf)
+        self.min_rr = float(min_rr)
+        self.cooldown_bars = int(cooldown_bars)
+        self.lock_after_trade_bars = int(lock_after_trade_bars)
+        self.breakout_buffer_atr = float(breakout_buffer_atr)
+        self.min_distance_from_prev_entry_atr = float(min_distance_from_prev_entry_atr)
+        self.max_candle_atr = float(max_candle_atr)
+        self.session_filter = bool(session_filter)
+        self.reentry_min_bars = int(reentry_min_bars)
+        self.reentry_reset_k = float(reentry_reset_k)
+        self.require_new_pivot = bool(require_new_pivot)
+
         self.last_signal = None
         self.signal_confirmation_count = 0
         self.end_time = end_time or datetime.utcnow()
 
-        # If you later need exchange price or server time; not used for data fetch now
-        self.exchange = ccxt.binance({
-            'enableRateLimit': True,
-            'options': {'defaultType': 'future'}  # perpetual futures
-        })
+        # BEST 状态 & 全局锁定
+        self._last_entry_side = None
+        self._last_entry_bar_time = None
+        self._last_stats_bar_time = None
+        self._last_break_sw_high = None
+        self._last_break_sw_low = None
 
-        # Timeframe conversion factors relative to 1h
-        self.tf_conversion = {
-            '1d': 24,
-            '4h': 6,
-            '1h': 1,
-            '30m': 0.5,
-            '15m': 0.25,
-            '5m': 0.083
-        }
+        # 统一锁定的数据：按主TF“条数” + 时间双重判定
+        self._lock_until_time = None
+        self._lock_until_bar_index = None  # 主TF索引（整数位置）
+
+        # Exchange（可选）
+        self.exchange = ccxt.binance({'enableRateLimit': True, 'options': {'defaultType': 'future'}})
+
+        # TF缩放（相对1h）
+        self.tf_conversion = {'1d': 24, '4h': 6, '1h': 1, '30m': 0.5, '15m': 0.25, '5m': 0.083}
 
         self.data: dict[str, pd.DataFrame] = {}
         self.load_data()
 
-    # -------------------------- Data Loading ------------------------------
+    # -------------------------- Utils -------------------------------------
     def _table_name(self, tf: str) -> str:
         base = self.symbol.replace('/', '_').lower()
-        return f"{base}_kline"
+        return f"{base}_kline"  # 如需分表可改：f"{base}_{tf}_kline"
 
+    def _tf_to_seconds(self, tf: str) -> int:
+        unit = ''.join([c for c in tf if c.isalpha()])
+        num = int(''.join([c for c in tf if c.isdigit()]) or 1)
+        mult = {'m':60, 'h':3600, 'd':86400}.get(unit, 3600)
+        return num * mult
+
+    def _is_time_ok(self, ts_utc: pd.Timestamp) -> bool:
+        if not self.session_filter:
+            return True
+        return ts_utc.hour not in (23, 0, 1)
+
+    # ---------- GLOBAL LOCK（统一锁定） ----------
+    def _current_primary_bar_info(self):
+        """返回主TF最后一根的 (time, pos)；若无则(None, None)"""
+        df = self.data.get(self.primary_tf)
+        if df is None or df.empty:
+            return None, None
+        ts = df.index[-1]
+        try:
+            pos = df.index.get_loc(ts)
+            if isinstance(pos, slice):
+                # 极少数情况，退化到长度-1
+                pos = len(df) - 1
+        except Exception:
+            pos = None
+        return ts, int(pos) if pos is not None else None
+
+    def _enter_global_lock(self, from_bar_time: pd.Timestamp):
+        """进入全局锁定：以主TF条数为单位 + 时间兜底。"""
+        df = self.data.get(self.primary_tf)
+        if df is None or df.empty:
+            # 仅按时间兜底
+            step_sec = self._tf_to_seconds(self.primary_tf)
+            self._lock_until_time = from_bar_time + pd.Timedelta(seconds=step_sec * self.lock_after_trade_bars)
+            self._lock_until_bar_index = None
+            logging.info(f"[LOCK] 仅时间锁定至 {self._lock_until_time}")
+            return
+
+        # 计算目标结束“条”位置
+        try:
+            start_idx = df.index.get_loc(from_bar_time)
+            if isinstance(start_idx, slice):
+                start_idx = len(df) - 1
+        except Exception:
+            start_idx = len(df) - 1
+
+        lock_end_idx = start_idx + self.lock_after_trade_bars
+        self._lock_until_bar_index = lock_end_idx
+
+        # 时间兜底（以免后续数据重载、缺K等造成偏差）
+        step_sec = self._tf_to_seconds(self.primary_tf)
+        self._lock_until_time = from_bar_time + pd.Timedelta(seconds=step_sec * self.lock_after_trade_bars)
+
+        logging.info(f"[LOCK] 条数锁定至 idx>={self._lock_until_bar_index}；时间锁定至 {self._lock_until_time}")
+
+    def _is_locked(self) -> bool:
+        """主TF条数优先；时间为兜底。"""
+        ts, pos = self._current_primary_bar_info()
+        # 条数判断
+        if self._lock_until_bar_index is not None and pos is not None:
+            if pos <= self._lock_until_bar_index:
+                return True
+        # 时间兜底
+        if self._lock_until_time is not None and ts is not None:
+            if ts <= self._lock_until_time:
+                return True
+        return False
+
+    # -------------------------- Data Loading ------------------------------
     def load_data(self) -> None:
-        """Load OHLCV for each timeframe from TDengine and minimally clean."""
         self.data = {}
         for tf in [self.tertiary_tf, self.secondary_tf, self.primary_tf]:
             try:
                 table = self._table_name(tf)
                 logging.info(f"读取 {self.symbol} {tf} => 表: {table}")
                 df = query_df_from_tdengine(table, tf, self.end_time)
-
-                # ---- 调试信息 ----
-                try:
-                    logging.info(f"[DEBUG] raw type={type(df)}, hasattr_len={hasattr(df, '__len__')}")
-                    if isinstance(df, pd.DataFrame):
-                        logging.info(f"[DEBUG] raw shape={df.shape}, columns={list(df.columns)[:10]}")
-                    else:
-                        df = pd.DataFrame(df)
-                        logging.info(f"[DEBUG] casted to DataFrame, shape={df.shape}, columns={list(df.columns)[:10]}")
-                except Exception:
-                    pass
-
+                df = pd.DataFrame(df)
                 if df is None or len(df) == 0:
-                    logging.warning(f"{table} 返回空数据(初始)")
+                    logging.warning(f"{table} 返回空数据")
                     continue
 
-                # ---- 列名标准化 ----
+                # 标准化
                 df.columns = [str(c).strip().lower() for c in df.columns]
                 alias_map = {'ts':'timestamp', 'time':'timestamp', 'vol':'volume'}
                 df.rename(columns={k:v for k,v in alias_map.items() if k in df.columns}, inplace=True)
 
-                # ---- 统一索引 ----
                 if 'timestamp' in df.columns:
                     ts0 = pd.to_numeric(df['timestamp'].iloc[0], errors='coerce')
                     if pd.notna(ts0) and np.isfinite(ts0):
-                        ts0 = int(ts0)
-                        unit = 'ms' if ts0 > 10**11 else 's'
+                        unit = 'ms' if int(ts0) > 10**11 else 's'
                         df['timestamp'] = pd.to_datetime(df['timestamp'], unit=unit, utc=True)
                     else:
                         df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True, errors='coerce')
@@ -157,71 +213,56 @@ class EnhancedMultiTimeframeStrategy:
 
                 df = df.sort_index()
 
-                # ---- 必要列检查 + 转数值 ----
-                needed = ['open', 'high', 'low', 'close', 'volume']
-                missing = [c for c in needed if c not in df.columns]
-                if missing:
-                    raise ValueError(f"{table} 缺少必要列: {missing}")
-
-                for col in needed:
+                # 数值列
+                for col in ['open','high','low','close','volume']:
+                    if col not in df.columns:
+                        raise ValueError(f"{table} 缺少列: {col}")
                     df[col] = pd.to_numeric(df[col], errors='coerce').astype('float64')
 
-                before_clean = len(df)
+                before = len(df)
                 df = df[~df.index.duplicated(keep='last')]
                 df = df.dropna(subset=['open','high','low','close','volume'])
                 df = df[df['volume'] > 0]
-                logging.info(f"[DEBUG] 清洗前行数={before_clean}，去重/NaN/成交量>0 后={len(df)}")
+                logging.info(f"[DEBUG] 清洗 {tf}: {before} -> {len(df)}")
 
-                if len(df) == 0:
-                    logging.warning(f"{self.symbol} {tf} 清洗后无数据")
-                    continue
-
-                self.data[tf] = df
+                if not df.empty:
+                    self.data[tf] = df
             except Exception as e:
-                logging.error(f"加载数据失败: {tf}, 错误: {str(e)}")
+                logging.error(f"加载数据失败: {tf}, 错误: {e}")
                 logging.error(traceback.format_exc())
 
     # ------------------------ Indicator Computation -----------------------
     def _p(self, x: float) -> int:
-        """Period helper: ensure >=1 integer."""
         return max(1, int(round(x)))
 
     def calculate_indicators(self, df: pd.DataFrame, tf: str) -> pd.DataFrame:
-        """计算指标，自动适配样本量，避免因 warmup 过长导致全 NaN。"""
         try:
             if df is None or len(df) == 0:
                 return df
-
-            # 确保数值类型，talib 需要 float64
             for col in ['open','high','low','close','volume']:
-                if col in df.columns:
-                    df[col] = pd.to_numeric(df[col], errors='coerce').astype('float64')
+                df[col] = pd.to_numeric(df[col], errors='coerce').astype('float64')
 
             mult = self.tf_conversion.get(tf, 1)
-            # 基础周期
             base = {
-                'boll': max(1, int(round(20 * mult))),
-                'macd_fast': max(1, int(round(12 * mult))),
-                'macd_slow': max(1, int(round(26 * mult))),
-                'macd_sig':  max(1, int(round(9  * mult))),
-                'rsi':       max(1, int(round(14 * mult))),
-                'vol_ma':    max(1, int(round(20 * mult))),
-                'ema50':     max(1, int(round(50 * mult))),
-                'ema200':    max(1, int(round(200 * mult))),
-                'atr':       max(1, int(round(14 * mult))),
+                'boll': self._p(20 * mult),
+                'macd_fast': self._p(12 * mult),
+                'macd_slow': self._p(26 * mult),
+                'macd_sig':  self._p(9  * mult),
+                'rsi':       self._p(14 * mult),
+                'vol_ma':    self._p(20 * mult),
+                'ema50':     self._p(50 * mult),
+                'ema200':    self._p(200 * mult),
+                'atr':       self._p(14 * mult),
             }
 
-            # 估算 warmup 需求
-            warmup_needed = max(base['ema200'], base['boll'], base['atr'], base['macd_slow'] + base['macd_sig'])
-
+            warm = max(base['ema200'], base['boll'], base['atr'], base['macd_slow'] + base['macd_sig'])
             n = len(df)
-            # 如果样本不足，动态下调周期到可用范围的约 1/3
-            if n <= warmup_needed:
-                scale = max(1, int(n // 3))
+            if n <= warm:
+                scale = max(10, int(n // 3))
                 for k in base:
-                    base[k] = max(1, min(base[k], scale))
-                logging.warning(f"[{tf}] 样本 {n} 小于 warmup {warmup_needed}，已自适应缩短周期: {base}")
-                warmup_needed = max(base.values())
+                    base[k] = max(10, min(base[k], scale))
+                logging.warning(f"[{tf}] 样本{n}<warmup{warm}，自适应周期: {base}")
+                warm = max(base.values())
 
             out = df.copy()
             out['upper'], out['middle'], out['lower'] = talib.BBANDS(out['close'], timeperiod=base['boll'], nbdevup=2, nbdevdn=2)
@@ -244,15 +285,11 @@ class EnhancedMultiTimeframeStrategy:
                 elif rsi[i-1] > 70 >= rsi[i]:
                     out.iloc[i, out.columns.get_loc('rsi_reversal')] = -1
 
-            # 只截取 warmup 之后的有效段，收敛 dropna 范围，避免误删
-            valid = out.iloc[max(0, warmup_needed-1):]
-            valid = valid.dropna(subset=['upper','middle','lower','ema50','ema200','macd','signal','hist','rsi','vol_ma','atr']).tail(1000)
-            if len(valid) == 0:
-                logging.warning(f"[{tf}] 指标计算后全部为 NaN，返回原数据以便排查。")
-                return out
-            return valid
+            valid = out.iloc[max(0, warm-1):]
+            valid = valid.dropna(subset=['upper','middle','lower','ema50','ema200','macd','signal','hist','rsi','vol_ma','atr'])
+            return valid if len(valid) else out
         except Exception as e:
-            logging.error(f"指标计算失败: {tf}, 错误: {str(e)}")
+            logging.error(f"指标计算失败: {tf}, 错误: {e}")
             logging.error(traceback.format_exc())
             return df
 
@@ -263,7 +300,6 @@ class EnhancedMultiTimeframeStrategy:
             hh = out['high'].rolling(5, center=True).max()
             ll = out['low'].rolling(5, center=True).min()
             obv_ma = talib.EMA(out['obv'], timeperiod=max(3, min(14, len(out)//6)))
-
             for i in range(5, len(out)):
                 if ll.iloc[i] < ll.iloc[i-5] and obv_ma.iloc[i] >= obv_ma.iloc[i-5]:
                     out.at[out.index[i], 'obv_divergence'] = 1
@@ -271,97 +307,61 @@ class EnhancedMultiTimeframeStrategy:
                     out.at[out.index[i], 'obv_divergence'] = -1
             return out
         except Exception as e:
-            logging.error(f"OBV背离检测失败: {str(e)}")
+            logging.error(f"OBV背离检测失败: {e}")
             return df
 
-
     # ---------------------------- Signals ---------------------------------
+    def _body_size(self, row) -> float:
+        return abs(row['close'] - row['open'])
+
     def generate_signal(self, df: pd.DataFrame) -> dict:
         try:
             if df is None or len(df) < 3:
                 return {'strength': 0, 'long': False, 'short': False, 'conditions': []}
 
-            last = df.iloc[-1]
-            prev = df.iloc[-2]
-
-            signal = {
-                'strength': 0,
-                'long': False,
-                'short': False,
-                'conditions': [],
-                'obv_divergence': 0,
-                'rsi_reversal': 0
-            }
+            last, prev = df.iloc[-1], df.iloc[-2]
+            signal = {'strength': 0, 'long': False, 'short': False, 'conditions': [], 'obv_divergence': 0, 'rsi_reversal': 0}
             vol_ok = last['volume'] > last['vol_ma']
 
-            # Long-side conditions (relaxed)
-            trend_conditions = []
-            if last['close'] > last['middle'] and last['middle'] > prev['middle']:
-                trend_conditions.append('Boll_Up')
-            if last['macd'] > last['signal'] and last['hist'] > 0:
-                trend_conditions.append('MACD_Up')
-            if last['rsi'] > 52:  # relaxed from 50~70
-                trend_conditions.append('RSI_Ok')
-            if last['trend'] == 'Up' and last['close'] > last['ema50']:
-                trend_conditions.append('Trend_Up')
-
-            # Volume as bonus (not a hard gate)
-            if last['volume'] > last['vol_ma']:
-                signal['strength'] += 1
-                signal['conditions'].append('Volume_Up')
-
-            if len(trend_conditions) >= 3:
+            # 多头
+            bull = []
+            if last['close'] > last['middle'] and last['middle'] > prev['middle']: bull.append('Boll_Up')
+            if last['macd'] > last['signal'] and last['hist'] > 0:                bull.append('MACD_Up')
+            if last['rsi'] > 52:                                                  bull.append('RSI_Ok')
+            if last['trend'] == 'Up' and last['close'] > last['ema50']:           bull.append('Trend_Up')
+            if len(bull) >= 3:
                 signal['long'] = True
-                signal['strength'] += len(trend_conditions) + 1  # +1 来自 vol_ok
-                signal['conditions'].extend(trend_conditions + ['Volume_Up'])
+                signal['strength'] += len(bull) + (1 if vol_ok else 0)
+                signal['conditions'].extend(bull + (['Volume_Up'] if vol_ok else []))
 
-            # Short-side conditions (relaxed)
-            short_conditions = []
-            if last['close'] < last['middle'] and last['middle'] < prev['middle']:
-                short_conditions.append('Boll_Down')
-            if last['macd'] < last['signal'] and last['hist'] < 0:
-                short_conditions.append('MACD_Down')
-            if last['rsi'] < 48:  # relaxed from 30~50
-                short_conditions.append('RSI_Ok')
-            if last['trend'] == 'Down' and last['close'] < last['ema50']:
-                short_conditions.append('Trend_Down')
-
-            if vol_ok and len(short_conditions) >= 3:
+            # 空头
+            bear = []
+            if last['close'] < last['middle'] and last['middle'] < prev['middle']: bear.append('Boll_Down')
+            if last['macd'] < last['signal'] and last['hist'] < 0:                 bear.append('MACD_Down')
+            if last['rsi'] < 48:                                                   bear.append('RSI_Ok')
+            if last['trend'] == 'Down' and last['close'] < last['ema50']:          bear.append('Trend_Down')
+            if len(bear) >= 3 and vol_ok:
                 signal['short'] = True
-                signal['strength'] += len(short_conditions) + 1
-                signal['conditions'].extend(short_conditions + ['Volume_Up'])
+                signal['strength'] += len(bear) + 1
+                signal['conditions'].extend(bear + ['Volume_Up'])
 
-            # Divergences
-            if last.get('obv_divergence', 0) == 1:
-                signal['obv_divergence'] = 1
-                signal['strength'] += 1
-                signal['conditions'].append('OBV_Bull_Div')
-            elif last.get('obv_divergence', 0) == -1:
-                signal['obv_divergence'] = -1
-                signal['strength'] += 1
-                signal['conditions'].append('OBV_Bear_Div')
-
-            # RSI reversals
-            if last.get('rsi_reversal', 0) == 1:
-                signal['rsi_reversal'] = 1
-                signal['strength'] += 1
-                signal['conditions'].append('RSI_Bull_Rev')
-            elif last.get('rsi_reversal', 0) == -1:
-                signal['rsi_reversal'] = -1
-                signal['strength'] += 1
-                signal['conditions'].append('RSI_Bear_Rev')
+            # 背离/反转
+            if last.get('obv_divergence', 0) == 1:  signal.update(obv_divergence=1);  signal['strength'] += 1; signal['conditions'].append('OBV_Bull_Div')
+            if last.get('obv_divergence', 0) == -1: signal.update(obv_divergence=-1); signal['strength'] += 1; signal['conditions'].append('OBV_Bear_Div')
+            if last.get('rsi_reversal', 0) == 1:    signal.update(rsi_reversal=1);    signal['strength'] += 1; signal['conditions'].append('RSI_Bull_Rev')
+            if last.get('rsi_reversal', 0) == -1:   signal.update(rsi_reversal=-1);   signal['strength'] += 1; signal['conditions'].append('RSI_Bear_Rev')
 
             return signal
         except Exception as e:
-            logging.error(f"信号生成失败: {str(e)}")
+            logging.error(f"信号生成失败: {e}")
             return {'strength': 0, 'long': False, 'short': False, 'conditions': []}
 
     def multi_timeframe_analysis(self) -> dict:
         try:
-            # Compute indicators/divergence per TF
+            # 计算指标
             for tf in list(self.data.keys()):
                 df = self.data.get(tf)
-                if df is None or len(df) == 0:
+                if df is None or df.empty:
                     continue
                 df = self.calculate_indicators(df, tf)
                 df = self.detect_obv_divergence(df)
@@ -370,81 +370,51 @@ class EnhancedMultiTimeframeStrategy:
                     continue
                 self.data[tf] = df
 
-            # Per-TF signals
-            signals: dict[str, dict] = {}
+            # 统一锁定：直接返回“锁定中”
+            if self._is_locked():
+                return {'long': False, 'short': False, 'confidence': 0, 'timeframes': [], 'type': '锁定中', 'details': {}}
+
+            # TF信号
+            signals = {}
             for tf in [self.tertiary_tf, self.secondary_tf, self.primary_tf]:
                 if tf in self.data:
-                    s = self.generate_signal(self.data[tf])
-                    logging.info(f"[{tf}] signal={s}")
-                    signals[tf] = s
+                    signals[tf] = self.generate_signal(self.data[tf])
 
-            combined = {
-                'long': False,
-                'short': False,
-                'confidence': 0,
-                'timeframes': [],
-                'type': '无信号',
-                'details': signals
-            }
+            combined = {'long': False, 'short': False, 'confidence': 0, 'timeframes': [], 'type': '无信号', 'details': signals}
 
-            long_tfs = [tf for tf in [self.tertiary_tf, self.secondary_tf, self.primary_tf]
-                        if tf in signals and signals[tf].get('long')]
-            short_tfs = [tf for tf in [self.tertiary_tf, self.secondary_tf, self.primary_tf]
-                         if tf in signals and signals[tf].get('short')]
+            long_tfs = [tf for tf in [self.tertiary_tf, self.secondary_tf, self.primary_tf] if tf in signals and signals[tf].get('long')]
+            short_tfs = [tf for tf in [self.tertiary_tf, self.secondary_tf, self.primary_tf] if tf in signals and signals[tf].get('short')]
 
-            # Confirmation mechanism (relaxed: >=)
+            # 至少两TF共振
             if len(long_tfs) >= 2:
-                if self.last_signal == 'long':
-                    self.signal_confirmation_count += 1
-                else:
-                    self.last_signal = 'long'
-                    self.signal_confirmation_count = 1
+                if self.last_signal == 'long': self.signal_confirmation_count += 1
+                else: self.last_signal, self.signal_confirmation_count = 'long', 1
                 if self.signal_confirmation_count >= self.confirmation_required:
-                    combined['long'] = True
-                    combined['short'] = False
-                    combined['type'] = '多头共振'
-                    combined['timeframes'] = long_tfs
-                    combined['confidence'] = int(50 + 25 * (len(long_tfs) - 1))
-                    self.signal_confirmation_count = 0
-                    self.last_signal = None
+                    combined.update(long=True, short=False, type='多头共振', timeframes=long_tfs,
+                                    confidence=int(50 + 25 * (len(long_tfs)-1)))
+                    self.signal_confirmation_count = 0; self.last_signal = None
             elif len(short_tfs) >= 2:
-                if self.last_signal == 'short':
-                    self.signal_confirmation_count += 1
-                else:
-                    self.last_signal = 'short'
-                    self.signal_confirmation_count = 1
+                if self.last_signal == 'short': self.signal_confirmation_count += 1
+                else: self.last_signal, self.signal_confirmation_count = 'short', 1
                 if self.signal_confirmation_count >= self.confirmation_required:
-                    combined['short'] = True
-                    combined['long'] = False
-                    combined['type'] = '空头共振'
-                    combined['timeframes'] = short_tfs
-                    combined['confidence'] = int(50 + 25 * (len(short_tfs) - 1))
-                    self.signal_confirmation_count = 0
-                    self.last_signal = None
+                    combined.update(short=True, long=False, type='空头共振', timeframes=short_tfs,
+                                    confidence=int(50 + 25 * (len(short_tfs)-1)))
+                    self.signal_confirmation_count = 0; self.last_signal = None
             else:
-                # 单TF强信号后备触发：primary_tf 强度 >= 4
-                primary = signals.get(self.primary_tf, {})
-                if primary.get('long') and primary.get('strength', 0) >= 4:
-                    combined['long'] = True
-                    combined['type'] = '单TF强多'
-                    combined['timeframes'] = [self.primary_tf]
-                    combined['confidence'] = 55
-                    self.signal_confirmation_count = 0
-                    self.last_signal = None
-                elif primary.get('short') and primary.get('strength', 0) >= 4:
-                    combined['short'] = True
-                    combined['type'] = '单TF强空'
-                    combined['timeframes'] = [self.primary_tf]
-                    combined['confidence'] = 55
-                    self.signal_confirmation_count = 0
-                    self.last_signal = None
+                if not self.require_two_tf:
+                    primary = signals.get(self.primary_tf, {})
+                    if primary.get('long') and primary.get('strength', 0) >= 4:
+                        combined.update(long=True, type='单TF强多', timeframes=[self.primary_tf], confidence=55)
+                    elif primary.get('short') and primary.get('strength', 0) >= 4:
+                        combined.update(short=True, type='单TF强空', timeframes=[self.primary_tf], confidence=55)
+                    else:
+                        self.signal_confirmation_count = 0; self.last_signal = None
                 else:
-                    self.signal_confirmation_count = 0
-                    self.last_signal = None
+                    self.signal_confirmation_count = 0; self.last_signal = None
 
             return combined
         except Exception as e:
-            logging.error(f"多时间框架分析失败: {str(e)}")
+            logging.error(f"多时间框架分析失败: {e}")
             logging.error(traceback.format_exc())
             return {'long': False, 'short': False, 'confidence': 0, 'timeframes': [], 'type': '分析错误'}
 
@@ -453,142 +423,287 @@ class EnhancedMultiTimeframeStrategy:
         try:
             if self.primary_tf not in self.data:
                 return {'entry': 0, 'stop_loss': 0, 'take_profit': [], 'rr_ratio': 0, 'rr_all': []}
-
             df = self.data[self.primary_tf]
             last = df.iloc[-1]
             targets = {'entry': float(last['close']), 'stop_loss': None, 'take_profit': [], 'rr_ratio': 0.0, 'rr_all': []}
 
             if signal.get('long'):
-                candidates = [last['lower'], df['low'].iloc[-5:].min(), last['close'] - 2 * last['atr']]
-                stop = float(min(candidates))
-                tps = [float(last['upper']), float(last['upper'] + last['atr']), float(last['upper'] + 2 * last['atr'])]
+                stop = float(min(last['lower'], df['low'].iloc[-5:].min(), last['close'] - 2*last['atr']))
+                tps  = [float(last['upper']), float(last['upper'] + last['atr']), float(last['upper'] + 2*last['atr'])]
                 risk = max(1e-8, float(last['close']) - stop)
-                rrs = [max(0.0, tp - float(last['close'])) / risk for tp in tps]
+                rrs  = [max(0.0, tp - float(last['close'])) / risk for tp in tps]
             elif signal.get('short'):
-                candidates = [last['upper'], df['high'].iloc[-5:].max(), last['close'] + 2 * last['atr']]
-                stop = float(max(candidates))
-                tps = [float(last['lower']), float(last['lower'] - last['atr']), float(last['lower'] - 2 * last['atr'])]
+                stop = float(max(last['upper'], df['high'].iloc[-5:].max(), last['close'] + 2*last['atr']))
+                tps  = [float(last['lower']), float(last['lower'] - last['atr']), float(last['lower'] - 2*last['atr'])]
                 risk = max(1e-8, stop - float(last['close']))
-                rrs = [max(0.0, float(last['close']) - tp) / risk for tp in tps]
+                rrs  = [max(0.0, float(last['close']) - tp) / risk for tp in tps]
             else:
                 return targets
 
-            targets['stop_loss'] = stop
-            targets['take_profit'] = tps
-            targets['rr_all'] = rrs
-            targets['rr_ratio'] = rrs[self.rr_tp_index] if rrs else 0.0
+            targets.update(stop_loss=stop, take_profit=tps, rr_all=rrs, rr_ratio=(rrs[self.rr_tp_index] if rrs else 0.0))
             return targets
         except Exception as e:
-            logging.error(f"价格目标计算失败: {str(e)}")
+            logging.error(f"价格目标计算失败: {e}")
             logging.error(traceback.format_exc())
             return {'entry': 0, 'stop_loss': 0, 'take_profit': [], 'rr_ratio': 0, 'rr_all': []}
+
+    # ------------------------- Pivots & Helpers ---------------------------
+    def _pivot_high_low(self, series: pd.Series, left=2, right=2):
+        n = len(series)
+        ph = pd.Series(False, index=series.index)
+        pl = pd.Series(False, index=series.index)
+        vals = series.values
+        for i in range(left, n - right):
+            win = vals[i-left:i+right+1]
+            if vals[i] == np.max(win): ph.iloc[i] = True
+            if vals[i] == np.min(win): pl.iloc[i] = True
+        return ph, pl
+
+    def _recent_swing(self, df: pd.DataFrame):
+        phh, pll = self._pivot_high_low(df['high'])
+        last_sw_high = df['high'][phh].tail(3).max() if phh.any() else df['high'].iloc[-5]
+        last_sw_low  = df['low'][pll].tail(3).min()  if pll.any() else df['low'].iloc[-5]
+        return float(last_sw_high), float(last_sw_low)
+
+    def _has_bull_bias(self, signals: dict) -> bool:
+        vote = 0
+        for tf in [self.tertiary_tf, self.secondary_tf]:
+            s = signals.get(tf, {})
+            vote += 1 if s.get('long') else (-1 if s.get('short') else 0)
+        return vote >= 1
+
+    def _has_bear_bias(self, signals: dict) -> bool:
+        vote = 0
+        for tf in [self.tertiary_tf, self.secondary_tf]:
+            s = signals.get(tf, {})
+            vote += -1 if s.get('short') else (1 if s.get('long') else 0)
+        return vote <= -1
+
+    def _is_mean_reversion_zone(self, row) -> bool:
+        in_boll_mid = abs(row['close'] - row['middle']) <= 0.5 * row['atr']
+        near_ema50  = abs(row['close'] - row['ema50'])  <= 0.5 * row['atr']
+        return in_boll_mid or near_ema50
+
+    def _macd_hist_rising(self, df: pd.DataFrame) -> bool:
+        if len(df) < 3: return False
+        h = df['hist'].iloc[-3:]
+        return (h.iloc[-1] > h.iloc[-2] > h.iloc[-3])
+
+    def _macd_hist_falling(self, df: pd.DataFrame) -> bool:
+        if len(df) < 3: return False
+        h = df['hist'].iloc[-3:]
+        return (h.iloc[-1] < h.iloc[-2] < h.iloc[-3])
+
+    def _cooldown_ok(self, side: str, current_bar_time) -> bool:
+        # 方向性的冷却（锁定是全局的；冷却保留方向性）
+        if self._last_entry_side != side or self._last_entry_bar_time is None:
+            return True
+        df = self.data[self.primary_tf]
+        try:
+            idx_now = df.index.get_loc(current_bar_time)
+            idx_last = df.index.get_loc(self._last_entry_bar_time)
+            if isinstance(idx_now, (int, np.integer)) and isinstance(idx_last, (int, np.integer)):
+                bars_since = idx_now - idx_last
+            else:
+                bars_since = 0
+        except Exception:
+            return True
+        return bars_since >= max(self.cooldown_bars, self.reentry_min_bars)
+
+    def _reset_done_since_last_entry(self, side: str, df: pd.DataFrame, last_idx, *, k: float = None) -> bool:
+        if k is None: k = self.reentry_reset_k
+        if self._last_entry_bar_time is None or self._last_entry_side != side:
+            return True
+        try:
+            start = df.index.get_loc(self._last_entry_bar_time)
+            end = df.index.get_loc(last_idx)
+        except Exception:
+            return True
+        if isinstance(start, slice) or isinstance(end, slice): return True
+        segment = df.iloc[start+1:end+1]
+        if segment.empty: return False
+        if side == 'long':
+            reset_mask = (segment['close'] <= segment['middle'] - k*segment['atr']) | (segment['close'] <= segment['ema50'] - k*segment['atr'])
+        else:
+            reset_mask = (segment['close'] >= segment['middle'] + k*segment['atr']) | (segment['close'] >= segment['ema50'] + k*segment['atr'])
+        if not bool(reset_mask.any()):
+            return False
+        if not self.require_new_pivot:
+            return True
+        phh, pll = self._pivot_high_low(df['high'])
+        return pll.iloc[start+1:end+1].any() if side == 'long' else phh.iloc[start+1:end+1].any()
+
+    # ------------------------- BEST ENTRY (Unified Lock) ------------------
+    def best_entry_trigger(self, signals: dict) -> dict:
+        # 全局锁定：直接禁止
+        if self._is_locked():
+            return {'side': None}
+
+        if self.primary_tf not in self.data:
+            return {'side': None}
+
+        df = self.data[self.primary_tf]
+        last = df.iloc[-1]
+        last_idx = df.index[-1]
+
+        if not self._is_time_ok(last_idx):
+            return {'side': None}
+        if self._body_size(last) > self.max_candle_atr * last['atr']:
+            return {'side': None}
+
+        # 摆动位、方向偏好、突破缓冲
+        sw_high, sw_low = self._recent_swing(df)
+        bull_ok = self._has_bull_bias(signals) and self._is_mean_reversion_zone(last)
+        bear_ok = self._has_bear_bias(signals) and self._is_mean_reversion_zone(last)
+        long_break  = last['close'] > (sw_high + self.breakout_buffer_atr * last['atr'])
+        short_break = last['close'] < (sw_low  - self.breakout_buffer_atr * last['atr'])
+
+        # MACD 复位（避免连打）
+        def _macd_reset_ok(_df, side):
+            if len(_df) < 5: return False
+            h = _df['hist'].iloc[-5:]
+            near_zero = h.abs().min() <= _df['atr'].iloc[-1] * 0.05
+            trend_ok  = (h.iloc[-1] > h.iloc[-2] > h.iloc[-3]) if side=='long' else (h.iloc[-1] < h.iloc[-2] < h.iloc[-3])
+            return near_zero or trend_ok
+
+        # 与上次入场的最小价格距离
+        def _min_dist_ok(side):
+            if self._last_entry_bar_time is None or self._last_entry_side != side:
+                return True
+            prev_price = float(df.loc[self._last_entry_bar_time]['close'])
+            return abs(float(last['close']) - prev_price) >= self.min_distance_from_prev_entry_atr * float(last['atr'])
+
+        # LONG
+        if bull_ok and long_break and (last['volume'] > last['vol_ma']) and self._macd_hist_rising(df):
+            if _macd_reset_ok(df, 'long') and _min_dist_ok('long') and self._cooldown_ok('long', last_idx) and self._reset_done_since_last_entry('long', df, last_idx):
+                rr = self.calculate_price_targets({'long': True, 'short': False})
+                if rr['rr_ratio'] >= self.min_rr:
+                    return {'side':'long','entry':float(last['close']),'stop':float(rr['stop_loss']),
+                            'tp': float(rr['take_profit'][self.rr_tp_index]), 'rr': float(rr['rr_ratio']),
+                            'bar_time': last_idx}
+
+        # SHORT
+        if bear_ok and short_break and (last['volume'] > last['vol_ma']) and self._macd_hist_falling(df):
+            if _macd_reset_ok(df, 'short') and _min_dist_ok('short') and self._cooldown_ok('short', last_idx) and self._reset_done_since_last_entry('short', df, last_idx):
+                rr = self.calculate_price_targets({'long': False, 'short': True})
+                if rr['rr_ratio'] >= self.min_rr:
+                    return {'side':'short','entry':float(last['close']),'stop':float(rr['stop_loss']),
+                            'tp': float(rr['take_profit'][self.rr_tp_index]), 'rr': float(rr['rr_ratio']),
+                            'bar_time': last_idx}
+
+        return {'side': None}
 
     # ---------------------------- Plotting --------------------------------
     def plot_multi_timeframe_chart(self, signal: dict) -> bool:
         try:
             fig, axes = plt.subplots(3, 1, figsize=(16, 18), sharex=False)
-            timeframes = [self.tertiary_tf, self.secondary_tf, self.primary_tf]
+            tfs = [self.tertiary_tf, self.secondary_tf, self.primary_tf]
             color = 'green' if signal.get('long') else ('red' if signal.get('short') else 'gray')
 
-            for i, tf in enumerate(timeframes):
-                if tf not in self.data:
-                    continue
-                df = self.data[tf]
-                ax = axes[i]
-
-                # Prepare OHLC for mplfinance
+            for i, tf in enumerate(tfs):
+                if tf not in self.data: continue
+                df = self.data[tf]; ax = axes[i]
                 date_num = mdates.date2num(df.index.to_pydatetime())
                 ohlc = np.column_stack([date_num, df[['open','high','low','close']].values])
+                candlestick_ohlc(ax, ohlc, width=0.8/len(tfs), colorup='g', colordown='r')
 
-                candlestick_ohlc(
-                    ax,
-                    ohlc,
-                    width=0.8/len(timeframes),
-                    colorup='g',
-                    colordown='r'
-                )
-
-                ax.plot(df.index, df['upper'],  linestyle='--', label='Upper Band', alpha=0.7)
-                ax.plot(df.index, df['middle'],               label='Middle Band', alpha=0.7)
-                ax.plot(df.index, df['lower'],  linestyle='--', label='Lower Band', alpha=0.7)
-                ax.plot(df.index, df['ema50'],                label='EMA50',       alpha=0.7)
-                ax.plot(df.index, df['ema200'],               label='EMA200',      alpha=0.7)
+                for col, ls in [('upper','--'), ('middle','-'), ('lower','--')]:
+                    ax.plot(df.index, df[col], linestyle=ls, label=col.title(), alpha=0.7)
+                ax.plot(df.index, df['ema50'], label='EMA50', alpha=0.7)
+                ax.plot(df.index, df['ema200'], label='EMA200', alpha=0.7)
 
                 if tf in signal.get('timeframes', []):
-                    ax.plot(df.index[-1], df['close'].iloc[-1], 'o', markersize=10, color=color, label='Signal')
+                    ax.plot(df.index[-1], df['close'].iloc[-1], 'o', ms=10, color=color, label='Signal')
 
-                obv_div_points = df[df['obv_divergence'] != 0].tail(10)
-                for idx, row in obv_div_points.iterrows():
+                obv_div = df[df['obv_divergence'] != 0].tail(10)
+                for idx, row in obv_div.iterrows():
                     c = 'green' if row['obv_divergence'] > 0 else 'red'
-                    ax.plot(idx, row['close'], 's', markersize=8, color=c, alpha=0.7)
+                    ax.plot(idx, row['close'], 's', ms=8, color=c, alpha=0.7)
 
-                ax.set_title(f"{self.symbol} - {tf} Timeframe")
-                ax.legend(loc='best')
-                ax.grid(True)
-                ax.xaxis_date()
-                ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
+                ax.set_title(f"{self.symbol} - {tf}")
+                ax.legend(loc='best'); ax.grid(True)
+                ax.xaxis_date(); ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
                 plt.setp(ax.get_xticklabels(), rotation=45)
 
             plt.tight_layout()
-            fig.suptitle(
-                f"{signal.get('type','无信号')} Signal - Confidence: {signal.get('confidence',0)}%",
-                fontsize=16, fontweight='bold', color=color
-            )
-
+            fig.suptitle(f"{signal.get('type','无信号')} - Confidence: {signal.get('confidence',0)}%", fontsize=16, fontweight='bold', color=color)
             out_path = f"{self.symbol.replace('/', '_')}_multi_timeframe.png"
-            plt.savefig(out_path, bbox_inches='tight')
-            plt.close()
+            plt.savefig(out_path, bbox_inches='tight'); plt.close()
             logging.info(f"图表已保存: {out_path}")
             return True
         except Exception as e:
-            logging.error(f"图表绘制失败: {str(e)}")
-            logging.error(traceback.format_exc())
-            return False
+            logging.error(f"图表绘制失败: {e}"); logging.error(traceback.format_exc()); return False
 
- 
     # -------------------------- Execution ---------------------------------
     def execute_trade(self, signal: dict, targets: dict) -> None:
         try:
-            logging.info("\n执行交易指令...")
             side = '买入' if signal.get('long') else ('卖出' if signal.get('short') else None)
-            if not side:
-                return
+            if not side: return
             logging.info(f"👉 {side} {self.symbol} @ {targets['entry']:.4f}")
             logging.info(f"⛔ 止损: {targets['stop_loss']:.4f}")
             for i, tp in enumerate(targets['take_profit']):
                 logging.info(f"🎯 目标{i+1}: {tp:.4f}  (RR≈{targets['rr_all'][i]:.2f}:1)")
         except Exception as e:
-            logging.error(f"交易执行失败: {str(e)}")
+            logging.error(f"交易执行失败: {e}")
 
+    # ----------------------------- Runner ---------------------------------
     def run_strategy(self, live_trading: bool = False, *, run_once: bool = False) -> None:
-        logging.info("启动多时间框架交易策略")
+        logging.info("启动多时间框架交易策略（统一锁定机制）")
         while True:
             try:
                 start_time = time.time()
 
                 self.load_data()
-                signal = self.multi_timeframe_analysis()
-                print(signal)
-                if signal.get('long') or signal.get('short'):
-                    targets = self.calculate_price_targets(signal)
+                mkt = self.multi_timeframe_analysis()
 
-                    logging.info("\n" + "=" * 50)
-                    logging.info(f"发现 {signal['type']} 信号!")
-                    logging.info(f"时间框架共振: {', '.join(signal['timeframes']) if signal['timeframes'] else '无'}")
-                    logging.info(f"置信度: {signal['confidence']}%")
-                    logging.info(f"当前价格: {targets['entry']:.4f}")
-                    logging.info(f"止损位: {targets['stop_loss']:.4f}")
-                    logging.info("止盈位:")
-                    for i, tp in enumerate(targets['take_profit']):
-                        logging.info(f"  TP{i + 1}: {tp:.4f}  (RR≈{targets['rr_all'][i]:.2f}:1)")
-                    logging.info(f"主展示 RR (TP{self.rr_tp_index+1}): {targets['rr_ratio']:.2f}:1")
+                # 统一锁定：直接跳过（日志提示）
+                if mkt.get('type') == '锁定中':
+                    logging.info("【锁定中】跳过本轮。")
+                else:
+                    # BEST ENTRY
+                    best = self.best_entry_trigger(mkt.get('details', {}))
+                    if best.get('side'):
+                        # 避免同一根重复输出
+                        if self._last_stats_bar_time != best['bar_time']:
+                            self._last_stats_bar_time = best['bar_time']
 
-                    if self.plot_multi_timeframe_chart(signal):
-                        logging.info("图表已保存!")
+                            final_sig = {
+                                'long': best['side']=='long',
+                                'short': best['side']=='short',
+                                'type': '最佳入场',
+                                'timeframes': [self.primary_tf],
+                                'confidence': 65 if best['rr'] >= (self.min_rr + 0.5) else 55,
+                                'details': mkt.get('details', {})
+                            }
+                            targets = self.calculate_price_targets(final_sig)
+                            # 与BEST快照对齐
+                            targets['entry'] = best['entry']
+                            targets['stop_loss'] = best['stop']
+                            if targets['take_profit']:
+                                targets['take_profit'][self.rr_tp_index] = best['tp']
+                            targets['rr_ratio'] = best['rr']
 
-                    if live_trading:
-                        self.execute_trade(signal, targets)
+                            logging.info("="*64)
+                            logging.info(f"【最佳入场】{best['side'].upper()} @ {best['entry']:.2f} | SL={best['stop']:.2f} | TP={best['tp']:.2f} | RR≈{best['rr']:.2f}:1")
+                            logging.info("="*64)
 
+                            # 标记最近入场
+                            self._last_entry_side = best['side']
+                            self._last_entry_bar_time = best['bar_time']
+
+                            # **统一锁定**：从本根开始，锁定 lock_after_trade_bars 条
+                            self._enter_global_lock(best['bar_time'])
+
+                            if self.plot_multi_timeframe_chart(final_sig):
+                                logging.info("图表已保存!")
+                            if live_trading:
+                                self.execute_trade(final_sig, targets)
+                        else:
+                            logging.info("跳过重复统计输出（同一K线）")
+                    else:
+                        logging.info("无【最佳入场】触发；等待下一根K线收盘。")
+
+                # 调度
                 processing_time = time.time() - start_time
                 sleep_minutes = 5
                 next_run_utc = datetime.utcnow() + timedelta(minutes=sleep_minutes)
@@ -597,29 +712,40 @@ class EnhancedMultiTimeframeStrategy:
                 logging.info(f"处理时间: {processing_time:.2f}秒")
                 logging.info(f"下一次扫描(UTC): {next_run_utc} (等待 {adjusted_sleep:.2f}秒)")
 
-                if run_once:
-                    break
+                if run_once: break
                 time.sleep(adjusted_sleep)
 
             except KeyboardInterrupt:
-                logging.info("用户中断策略执行")
-                break
+                logging.info("用户中断策略执行"); break
             except Exception as e:
-                logging.error(f"策略运行错误: {str(e)}")
+                logging.error(f"策略运行错误: {e}")
                 logging.error(traceback.format_exc())
-                time.sleep(300)  # backoff 5 minutes
+                time.sleep(300)  # backoff
 
 
 if __name__ == '__main__':
-    # 简单自测：只跑一次，便于在日志中观察信号
+    # 示例：仅跑一轮，使用统一锁定的参数
     strat = EnhancedMultiTimeframeStrategy(
         symbol='BTC/USDT',
         primary_tf='1h',
         secondary_tf='4h',
         tertiary_tf='1d',
-        end_time=datetime.now(),
+        end_time=datetime.utcnow(),
         table_with_tf=True,
-        confirmation_required=0,  # 测试阶段建议 0
+        confirmation_required=1,
         rr_tp_index=1,
+
+        # 统一锁定 & 去噪参数（可调）
+        require_two_tf=True,
+        min_rr=2.5,
+        cooldown_bars=16,
+        lock_after_trade_bars=24,
+        breakout_buffer_atr=0.30,
+        min_distance_from_prev_entry_atr=0.60,
+        max_candle_atr=1.2,
+        session_filter=True,
+        reentry_min_bars=8,
+        reentry_reset_k=0.25,
+        require_new_pivot=True,
     )
     strat.run_strategy(run_once=True)
